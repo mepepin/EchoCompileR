@@ -1,0 +1,226 @@
+---
+title: "Echocardiography Analysis"
+author: "Mark E. Pepin"
+date: "3/09/2021"
+output: 
+  html_document: 
+    toc: yes
+    number_sections: yes
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+This script contains the coding needed to import, clean, visualize, and analyze echocardiographic data.
+
+## Clean raw data from Echocardiography tracings.
+
+The reports (.csv) generated from the Echo software produces a poorly-formatted sheet of information that needs to be parsed to extract phenotypic parameters. This function looks within all sub-directories for the echo reports (".csv"), and compiles them. Once compiled, this table is exported as "**Master_Table.xlsx**" in the same directory where the script is run.
+
+```{r clean.raw}
+library(openxlsx)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+Echo_tS<-Sys.time()
+temp = list.files(path = "./", pattern="*\\csv", recursive = TRUE)
+Timeline = c() #create an empty timeline vector for echo study dates
+Master_Table<-as.data.frame(matrix(ncol =4, nrow = 1))
+Master_Names<-c("Echo_Param", "Dates", "Value", "Sample_ID")
+colnames(Master_Table)<-Master_Names
+TableList<-c()
+##########################
+for (i in 1:length(temp)) { #do the following  (see below) for every echo analysis .csv file found
+# Compile ridiculous table containing all data
+Echo_Table<-read.table(paste0("./", temp[i]), header = FALSE, sep = ";", fill = TRUE, dec = ",")
+Echo_Table[(nrow(Echo_Table)+1):(nrow(Echo_Table)+100),]<-""
+## Save Study date
+studyDate<-Echo_Table[which(grepl("Study Date", Echo_Table[,1])),2]
+  studyDate<-strptime(as.character(studyDate), format = "%d.%m.%Y")
+  studyDate<-as.Date(studyDate)
+  # studyDate<-as.POSIXct(format(studyDate, "%Y-%m-%d"), format = "%Y-%m-%d") # reformats the date (easier to sort)
+  Timeline[i]<-studyDate # put this date into the timeline vector
+## Sample names/rows
+sampleRows<-which(grepl("Series Name", Echo_Table[,1])) # extract rows for each sample
+sampleNames<-Echo_Table[sampleRows,2] # extract sample names
+## Sample-specific Study dates
+sampleDatesRows<-which(grepl("Series Date", Echo_Table[,1])) # extract rows for each sample
+sampleDates<-Echo_Table[sampleDatesRows,2] # extract sample names
+  sampleDates<-strptime(as.character(sampleDates), format = "%d.%m.%Y")
+  sampleDates<-as.Date(sampleDates)
+sampleIndex<-cbind(sampleNames, sampleDates) #sample-date combination
+## Create an echo table for each time point/file
+Table<-data.frame(sampleNames)
+List<-list()
+for (j in 1:length(sampleRows)) { # FOR every sample, grab the echo parameters
+    j_table<-Echo_Table[(sampleRows[j]):(sampleRows[j]+72),]
+    j_tableM<-j_table %>% filter((grepl("MAutoLV", V1) & grepl("M-Mode", V2)) | (grepl("LV Trace", V1) & grepl("M-Mode", V2)) | (grepl("LV Area", V1) & 
+      grepl("M-Mode", V2)))
+    j_tableB<-j_table %>% filter((grepl("MAutoLV", V1) & grepl("B-Mode", V2)) | (grepl("LV Trace", V1) & grepl("B-Mode", V2)) | (grepl("LV Area", V1) & 
+      grepl("B-Mode", V2)))
+    j_tableB$V1<-gsub("(Long).*", "\\1", j_tableB$V1)
+    j_tableB$V1<-gsub("(Short).*", "\\1", j_tableB$V1)
+    j_tableM$V1<-gsub("(MAutoLV).*", "\\1", j_tableM$V1)
+    j_tableBM<-rbind(j_tableM, j_tableB)
+    j_tableBM<-j_tableBM %>% unite("Echo_Param", V1:V3, remove = T)
+    rownames(j_tableBM)<-j_tableBM$Echo_Param
+    colnames(j_tableBM)<-c("Echo_Param", "Units", sampleNames[j])
+    j_tableBM<-as.data.frame(j_tableBM)
+    j_tableBM<-j_tableBM %>% select(-Units)
+    j_tableBM$Dates<-sampleDates[j]
+    j_tableBM[,sampleNames[j]]<-as.numeric(gsub(",", ".", j_tableBM[,sampleNames[j]])) #Convert Echo values to numeric "." data.
+    List[[j]]<-as.data.frame(j_tableBM) #Convert all echo tables into a list 1:length(sampleNames)
+    } # Extracts sample echo data from the master table, assembling into a nicer one...
+Full_Table<-List %>% reduce(full_join) #merge all echo tables and remove duplicated Measurements (M-Mode)
+Echo_Interim<-gather(Full_Table, "Sample", Value, -Dates, -Echo_Param, na.rm = TRUE) %>% mutate(Sample_ID=Sample) %>% select(-Sample) %>% distinct()
+# Add these samples/dates to the "Master Table"
+TableList[[i]]<-Echo_Interim
+}
+Echo.Database_gathered<-TableList %>% reduce(full_join)
+Echo.Database_spread<-Echo.Database_gathered %>% spread(key = Echo_Param, value = Value)
+write.xlsx(Echo.Database_spread, paste0("Echo_Summary.Table_", Sys.Date(), ".xlsx"))
+```
+
+## Import Metadata for Mice
+
+This next step is specific for a given project, and requires information about each mouse (genotype, sex, treatment, etc..). **This must meet the following parameters:**
+
+1.  It must be created using an **"\_Index.xlsx**" ending and placed in the same folder location where this script is run.
+
+2.  It must contain a "Sample_ID" column where each mouse identifier is located. NOTE: this must be identical to the identifiers used to label mice within the Echo reports.
+
+3.  **"Duration"** (this is derived from "**Int_Date**" (Date of the intervention) and "**Study_Date**" (Date of Echo)
+
+```{r Index}
+library(openxlsx)
+library(dplyr)
+library(tibble)
+Index_loc = list.files(path = "./", pattern="*\\Index.xlsx")
+Index<-read.xlsx(Index_loc)
+Index<-Index %>% filter(Sample_ID!="NA") %>% mutate(Sample_ID = as.character(Sample_ID)) #Remove rows with missing Sample_ID (without this, there is no point...)
+head(Index)
+Annotated_echo<-Index %>% full_join(rownames_to_column(Echo.Database_spread), sto.info, by = ("rowname" = "Sample_ID")) #Merge index to Master Echo table
+##Format Index with new rows
+Annotated_echo$Int_Date<-as.Date(Annotated_echo$Int_Date, origin="1899-12-30") # Intervention Date (Excel time)
+Annotated_echo$DOB<-as.Date(Annotated_echo$DOB, origin="1899-12-30") # Geburtsdatum (Excel time)
+Annotated_echo$DOD<-as.Date(Annotated_echo$DOD, origin="1899-12-30") # Tot Datum (Excel time)
+Annotated_echo<-Annotated_echo %>% mutate(Age.t0=Int_Date-DOB) # Tot Datum (Excel time)
+Annotated_echo<-Annotated_echo %>% mutate(Duration=Dates-Int_Date) #Relative Time (Echo - Intervention)
+Annotated_echo$Group<-factor(Annotated_echo$Group, levels = c("WT_Sham", "WT_ORAB", "BAP1_Sham", "BAP1_ORAB"))
+#Export compiled table
+write.xlsx(Annotated_echo, paste0("Annotated.Echo_Summary.Table_", Sys.Date(), ".xlsx"))
+```
+
+## Time-Course Study
+
+It is often useful to see phenotypic changes with respect to time. For this reason, a scatter plot can be generated that plots these changes for each experimental group. To run this code, you must have a column entitled "**Group**" which contains the groups you wish to compare.
+
+```{r Echo, echo=FALSE}
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+#Plot EF over time
+All_Echoes<-Annotated_echo %>% drop_na(Sample_ID, Group, `LV Trace_M-Mode_Fractional Shortening`) # Remove NA's
+ggplot(data = All_Echoes, aes(x = Duration, y = `LV Trace_M-Mode_Fractional Shortening`, color = Group)) + 
+  geom_point() + 
+  geom_smooth() + #Need more than 1 date to use this...
+  ylim(5,95) +
+  theme_bw()
+```
+
+# Group-wise comparison
+
+In addition to time-course studies, it can be helpful to compute statistical comparison between experimental groups at each time-point. The following script accomplishes this by iteratively performing pairwise statistics with respect to the "**WT-Sham**" value in the "**Group**" Column.
+
+```{r groupwise}
+library(ggplot2)
+library(gridExtra)
+library(ggpubr)
+library(dplyr)
+library(gtools)
+library(openxlsx)
+library(tidyr)
+ifelse(!dir.exists(file.path("Echo_Comparisons")), dir.create(file.path("Echo_Comparisons")), FALSE)
+COMPARISONS = list(c("WT_Sham", "WT_ORAB"), c("WT_Sham", "BAP1_WT"), c("WT_Sham", "BAP1_ORAB"), c("BAP1_Sham", "BAP1_ORAB"))
+## For loop creating a graph for each gene
+plotlist = list()
+p<-1
+All_Echoes<-Annotated_echo %>% drop_na(Sample_ID, Group, `LV Trace_M-Mode_Ejection Fraction`) #Remove NA's
+Echo_dates<-unique(All_Echoes$Dates) #Identify all dates in this file
+for (i in seq_along(Echo_dates)){
+  Echo_time<-All_Echoes %>% filter(Dates==Echo_dates[i]) %>% mutate(LVEF = `LV Trace_M-Mode_Ejection Fraction`)
+g_plot<-ggboxplot(Echo_time, x = "Group", 
+          y = "LVEF", 
+          fill = "Group",
+          add = "jitter"
+          ) + 
+  ggtitle(paste0("LVEF at ", Echo_time$Duration[i], " days")) +
+  stat_compare_means(aes(group = Group),
+                    comparisons = COMPARISONS, 
+                    label = "p.signif"
+                    ) +
+  theme(axis.text.x=element_text(size=rel(0.75)), axis.text.y=element_text(size=rel(0.75)), legend.position="bottom") + # resize labels, remove legend
+  scale_y_continuous(limits = c(0, 100)) # + # expand = expansion(mult = c(0, 0.1)) ### Y scale (to see the statistics)
+  # geom_text_repel(aes(label=Sample_ID), , color = "grey", size = 2) # Add Sample_ID
+g_plot
+pdf(file=paste0("Echo_Comparisons/", Echo_time$Duration[i], "_Echoes.pdf"), width = 6, height = 3)
+print(g_plot)
+dev.off()
+plotlist[[i]] = g_plot
+}
+t<-marrangeGrob(grobs = plotlist, legend, nrow=2, ncol=1)
+ggsave(paste0("Echo_Comparisons/",i, "_ALL.pdf"), t, width = 6.5, height = 9)
+t
+```
+
+# Survival Plots
+
+```{r}
+library(survminer)
+library(survminer)
+library(RTCGA.clinical)
+survivalTCGA(BRCA.clinical, OV.clinical,
+             extract.cols = "admin.disease_code") -> BRCAOV.survInfo
+library(survival)
+fit <- survfit(Surv(times, patient.vital_status) ~ admin.disease_code,
+               data = BRCAOV.survInfo)
+# Visualize with survminer
+ggsurvplot(fit, data = BRCAOV.survInfo, risk.table = TRUE)
+###################################################
+ggsurvplot(
+   fit,                     # survfit object with calculated statistics.
+   data = BRCAOV.survInfo,  # data used to fit survival curves. 
+   risk.table = TRUE,       # show risk table.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   xlim = c(0,2000),        # present narrower X axis, but not affect
+                            # survival estimates.
+   break.time.by = 250,     # break X axis in time intervals by 500.
+   ggtheme = theme_minimal(), # customize plot and risk table with a theme.
+ risk.table.y.text.col = T, # colour risk table text annotations.
+  risk.table.y.text = FALSE # show bars instead of names in text annotations
+                            # in legend of risk table
+)
+```
+
+# **Script References**
+
+```{r references}
+Echo_tE<-Sys.time()
+Time.Run<-Echo_tE-Echo_tS
+Time.Run
+options(kableExtra.latex.load_packages = FALSE)
+library(kableExtra)
+sinfo<-devtools::session_info()
+sinfo$platform
+sinfo$packages %>% kable( 
+                         align="c", 
+                         longtable=T, 
+                         booktabs=T,
+                         caption="Packages and Required Dependencies") %>% 
+    kable_styling(latex_options=c("striped", "repeat_header", "condensed"))
+```
